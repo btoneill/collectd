@@ -53,6 +53,10 @@
 #if HAVE_IOKIT_IOBSD_H
 #  include <IOKit/IOBSD.h>
 #endif
+#if KERNEL_FREEBSD
+#include <devstat.h>
+#include <libgeom.h>
+#endif
 
 #if HAVE_LIMITS_H
 # include <limits.h>
@@ -72,23 +76,6 @@
 # include <sys/protosw.h>
 # include <libperfstat.h>
 #endif
-
-#ifndef COLLECTD_MNTTAB
-# if defined(_PATH_MOUNTED) /* glibc */
-#  define COLLECTD_MNTTAB _PATH_MOUNTED
-# elif defined(MNTTAB) /* Solaris */
-#  define COLLECTD_MNTTAB MNTTAB
-# elif defined(MNT_MNTTAB)
-#  define COLLECTD_MNTTAB MNT_MNTTAB
-# elif defined(MNTTABNAME)
-#  define COLLECTD_MNTTAB MNTTABNAME
-# elif defined(KMTAB)
-#  define COLLECTD_MNTTAB KMTAB
-# else
-#  define COLLECTD_MNTTAB "/etc/mnttab"
-# endif
-#endif
-
 
 #if HAVE_IOKIT_IOKITLIB_H
 static mach_port_t io_master_port = MACH_PORT_NULL;
@@ -124,16 +111,15 @@ typedef struct diskstats
 
 static diskstats_t *disklist;
 /* #endif KERNEL_LINUX */
+#elif KERNEL_FREEBSD
+static struct gmesh geom_tree;
+/* #endif KERNEL_FREEBSD */
 
 #elif HAVE_LIBKSTAT
 #define MAX_NUMDISK 1024
 extern kstat_ctl_t *kc;
 static kstat_t *ksp[MAX_NUMDISK];
 static int numdisk = 0;
-#include <sys/vnode.h>
-#include <sys/mnttab.h>
-
-
 /* #endif HAVE_LIBKSTAT */
 
 #elif defined(HAVE_LIBSTATGRAB)
@@ -243,12 +229,23 @@ static int disk_init (void)
 	/* do nothing */
 /* #endif KERNEL_LINUX */
 
+#elif KERNEL_FREEBSD
+	int rv;
+
+	rv = geom_gettree(&geom_tree);
+	if (rv != 0) {
+		ERROR ("geom_gettree() failed, returned %d", rv);
+		return (-1);
+	}
+	rv = geom_stats_open();
+	if (rv != 0) {
+		ERROR ("geom_stats_open() failed, returned %d", rv);
+		return (-1);
+	}
+/* #endif KERNEL_FREEBSD */
+
 #elif HAVE_LIBKSTAT
 	kstat_t *ksp_chain;
-    FILE *fp;
-    char devid[64];
-    struct mnttab mnt;
-
 
 	numdisk = 0;
 
@@ -260,24 +257,11 @@ static int disk_init (void)
 			ksp_chain = ksp_chain->ks_next)
 	{
 		if (strncmp (ksp_chain->ks_class, "disk", 4)
-                && strncmp (ksp_chain->ks_name,  "vopstats_", 9)
 				&& strncmp (ksp_chain->ks_class, "partition", 9))
 			continue;
-        if (ksp_chain->ks_type == KSTAT_TYPE_IO)
-            ksp[numdisk++] = ksp_chain;
-        else if (ksp_chain->ks_type == KSTAT_TYPE_NAMED) {
-            ssnprintf(devid,sizeof(devid),"dev=%s",ksp_chain->ks_name + 9);
-            fp=fopen(COLLECTD_MNTTAB,"r");
-            while(getmntent(fp,&mnt) == 0) {
-                if(strcmp((char *) "zfs", mnt.mnt_fstype) == 0) {
-                    if(hasmntopt(&mnt, (char *) devid)) {
-                        ksp[numdisk++] = ksp_chain;
-                    }
-                }
-            }
-            fclose(fp);
-        } else
+		if (ksp_chain->ks_type != KSTAT_TYPE_IO)
 			continue;
+		ksp[numdisk++] = ksp_chain;
 	}
 #endif /* HAVE_LIBKSTAT */
 
@@ -543,6 +527,113 @@ static int disk_read (void)
 	IOObjectRelease (disk_list);
 /* #endif HAVE_IOKIT_IOKITLIB_H */
 
+#elif KERNEL_FREEBSD
+	int retry, dirty;
+
+	void *snap = NULL;
+	struct devstat *snap_iter;
+
+	struct gident *geom_id;
+
+	const char *disk_name;
+	long double read_time, write_time;
+
+	for (retry = 0, dirty = 1; retry < 5 && dirty == 1; retry++) {
+		if (snap != NULL)
+			geom_stats_snapshot_free(snap);
+
+		/* Get a fresh copy of stats snapshot */
+		snap = geom_stats_snapshot_get();
+		if (snap == NULL) {
+			ERROR("disk plugin: geom_stats_snapshot_get() failed.");
+			return (-1);
+		}
+
+		/* Check if we have dirty read from this snapshot */
+		dirty = 0;
+		geom_stats_snapshot_reset(snap);
+		while ((snap_iter = geom_stats_snapshot_next(snap)) != NULL) {
+			if (snap_iter->id == NULL)
+				continue;
+			geom_id = geom_lookupid(&geom_tree, snap_iter->id);
+
+			/* New device? refresh GEOM tree */
+			if (geom_id == NULL) {
+				geom_deletetree(&geom_tree);
+				if (geom_gettree(&geom_tree) != 0) {
+					ERROR("disk plugin: geom_gettree() failed");
+					geom_stats_snapshot_free(snap);
+					return (-1);
+				}
+				geom_id = geom_lookupid(&geom_tree, snap_iter->id);
+			}
+			/*
+			 * This should be rare: the device come right before we take the
+			 * snapshot and went away right after it.  We will handle this
+			 * case later, so don't mark dirty but silently ignore it.
+			 */
+			if (geom_id == NULL)
+				continue;
+
+			/* Only collect PROVIDER data */
+			if (geom_id->lg_what != ISPROVIDER)
+				continue;
+
+			/* Only collect data when rank is 1 (physical devices) */
+			if (((struct gprovider *)(geom_id->lg_ptr))->lg_geom->lg_rank != 1)
+				continue;
+
+			/* Check if this is a dirty read quit for another try */
+			if (snap_iter->sequence0 != snap_iter->sequence1) {
+				dirty = 1;
+				break;
+			}
+		}
+	}
+
+	/* Reset iterator */
+	geom_stats_snapshot_reset(snap);
+	for (;;) {
+		snap_iter = geom_stats_snapshot_next(snap);
+		if (snap_iter == NULL)
+			break;
+
+		if (snap_iter->id == NULL)
+			continue;
+		geom_id = geom_lookupid(&geom_tree, snap_iter->id);
+		if (geom_id == NULL)
+			continue;
+		if (geom_id->lg_what != ISPROVIDER)
+			continue;
+		if (((struct gprovider *)(geom_id->lg_ptr))->lg_geom->lg_rank != 1)
+			continue;
+		/* Skip dirty reads, if present */
+		if (dirty && (snap_iter->sequence0 != snap_iter->sequence1))
+			continue;
+
+		disk_name = ((struct gprovider *)geom_id->lg_ptr)->lg_name;
+
+		if ((snap_iter->bytes[DEVSTAT_READ] != 0) || (snap_iter->bytes[DEVSTAT_WRITE] != 0)) {
+			disk_submit(disk_name, "disk_octets",
+					(derive_t)snap_iter->bytes[DEVSTAT_READ],
+					(derive_t)snap_iter->bytes[DEVSTAT_WRITE]);
+		}
+
+		if ((snap_iter->operations[DEVSTAT_READ] != 0) || (snap_iter->operations[DEVSTAT_WRITE] != 0)) {
+			disk_submit(disk_name, "disk_ops",
+					(derive_t)snap_iter->operations[DEVSTAT_READ],
+					(derive_t)snap_iter->operations[DEVSTAT_WRITE]);
+		}
+
+		read_time = devstat_compute_etime(&snap_iter->duration[DEVSTAT_READ], NULL);
+		write_time = devstat_compute_etime(&snap_iter->duration[DEVSTAT_WRITE], NULL);
+		if ((read_time != 0) || (write_time != 0)) {
+			disk_submit (disk_name, "disk_time",
+					(derive_t)(read_time*1000), (derive_t)(write_time*1000));
+		}
+	}
+	geom_stats_snapshot_free(snap);
+
 #elif KERNEL_LINUX
 	FILE *fh;
 	char buffer[1024];
@@ -791,92 +882,103 @@ static int disk_read (void)
 
 #elif HAVE_LIBKSTAT
 # if HAVE_KSTAT_IO_T_WRITES && HAVE_KSTAT_IO_T_NWRITES && HAVE_KSTAT_IO_T_WTIME
-#  define KIO_ROCTETS reads
-#  define KIO_WOCTETS writes
-#  define KIO_ROPS    nreads
-#  define KIO_WOPS    nwrites
-#  define KIO_RTIME   rtime
-#  define KIO_WTIME   wtime
+#  define KIO_ROCTETS    reads
+#  define KIO_WOCTETS    writes
+#  define KIO_ROPS       nreads
+#  define KIO_WOPS       nwrites
+#  define KIO_RTIME      rtime
+#  define KIO_RLENTIME   rlentime
+#  define KIO_WTIME      wtime
+#  define KIO_WLENTIME   wlentime
+#  define KIO_SNAPTIME   ks_snaptime 
 # elif HAVE_KSTAT_IO_T_NWRITTEN && HAVE_KSTAT_IO_T_WRITES && HAVE_KSTAT_IO_T_WTIME
-#  define KIO_ROCTETS nread
-#  define KIO_WOCTETS nwritten
-#  define KIO_ROPS    reads
-#  define KIO_WOPS    writes
-#  define KIO_RTIME   rtime
-#  define KIO_WTIME   wtime
-#  define VOP_ROPS    nread
-#  define VOP_WOPS    nwrite
-#  define VOP_RDIR    nreaddir
-#  define VOP_ROCTETS read_bytes
-#  define VOP_WOCTETS write_bytes
+#  define KIO_ROCTETS    nread
+#  define KIO_WOCTETS    nwritten
+#  define KIO_ROPS       reads
+#  define KIO_WOPS       writes
+#  define KIO_RTIME      rtime
+#  define KIO_RLENTIME   rlentime
+#  define KIO_WTIME      wtime
+#  define KIO_WLENTIME   wlentime
+#  define KIO_SNAPTIME   ks_snaptime 
 # else
 #  error "kstat_io_t does not have the required members"
 # endif
 	static kstat_io_t kio;
-    static vopstats_t knamed;
-
+    static uint_t last_rw_iops[MAX_NUMDISK];    /* total number of iops from last cycle */
+    static hrtime_t last_rtime[MAX_NUMDISK];    /* nanoseconds since boot of runtime on disk from last cycle */
+    static hrtime_t last_wtime[MAX_NUMDISK];    /* nanoseconds since boot of wait time on disk from last cycle */
+    uint_t rw_iops;                             /* number of read and write ops since boot */
+    useconds_t rtime_us=0;                        /* run time in microseconds this poll cycle */
+    useconds_t wtime_us=0;                        /* wait time in microseconds this poll cycle */
+    uint_t new_iops=0;                            /* number of iops this cycle */
+    uint_t rtime_per_op = 0;                    /* run time microseconds per op */
+    uint_t wtime_per_op = 0;                    /* wait time microseconds per op */
 	int i;
-    uint64_t numops;
-    char nicename[128];
-    char devid[128];
-    FILE *fp;
-    struct mnttab mnt;
-
 
 	if (kc == NULL)
 		return (-1);
 
 	for (i = 0; i < numdisk; i++)
 	{
+		if (kstat_read (kc, ksp[i], &kio) == -1)
+			continue;
 
-        /* parse solaris vopstats_ */
-        if (strncmp (ksp[i]->ks_name, "vopstats_", 9) == 0) {
-            if (kstat_read (kc, ksp[i], &knamed) == -1)
+		if (strncmp (ksp[i]->ks_class, "disk", 4) == 0)
+		{
+
+            /* Get total number of read and write ops */
+            rw_iops = kio.KIO_ROPS + kio.KIO_WOPS;
+
+            /* If we have no last rw ops, skip reporting this cycle */
+            if(last_rw_iops[i] == 0) {
+                last_rw_iops[i] = rw_iops;
+                last_rtime[i] = kio.KIO_RTIME;
+                last_wtime[i] = kio.KIO_WTIME;
+                WARNING("just did init of %s",ksp[i]->ks_name);
                 continue;
-
-            /* get number of ops */
-            numops = (uint64_t) knamed.VOP_ROPS.value.ui64 + (uint64_t) knamed.VOP_WOPS.value.ui64 + (uint64_t) knamed.VOP_RDIR.value.ui64;
-           
-            /* if no ops, we skip */
-            if(numops == 0)
-                continue;
-       
-            /* need to get mnttab format of dev= id */
-            snprintf(devid,sizeof(devid),"dev=%s",ksp[i]->ks_name + 9);
-            
-            fp=fopen(COLLECTD_MNTTAB,"r");
-
-            /* we look for all ZFS filesystem, then check devid, then get name */
-            while(getmntent(fp,&mnt) == 0) {
-                if(strcmp((char *) "zfs", mnt.mnt_fstype) == 0) {
-                    if(hasmntopt(&mnt, (char *) devid)) {
-                        /* we put zpool: infront of the name */
-                        snprintf(nicename,sizeof(nicename),"zpool:%s",mnt.mnt_special);
-                        disk_submit (nicename, "disk_octets", knamed.VOP_ROCTETS.value.ui64, knamed.VOP_WOCTETS.value.ui64);
-                        disk_submit (nicename, "disk_ops", knamed.VOP_ROPS.value.ui64, knamed.VOP_WOPS.value.ui64);
-                        continue;
-                    }
-                }
             }
-            fclose(fp);
-        } else {
-		    if (kstat_read (kc, ksp[i], &kio) == -1)
-			    continue;
 
-		    if (strncmp (ksp[i]->ks_class, "disk", 4) == 0)
-		    {
-			    disk_submit (ksp[i]->ks_name, "disk_octets", kio.KIO_ROCTETS, kio.KIO_WOCTETS);
-                disk_submit (ksp[i]->ks_name, "disk_ops", kio.KIO_ROPS, kio.KIO_WOPS);
-                /* FIXME: Convert this to microseconds if necessary */
-                disk_submit (ksp[i]->ks_name, "disk_time", kio.KIO_RTIME, kio.KIO_WTIME);
-		    }
-		    else if (strncmp (ksp[i]->ks_class, "partition", 9) == 0)
-		    {
-			    disk_submit (ksp[i]->ks_name, "disk_octets", kio.KIO_ROCTETS, kio.KIO_WOCTETS);
-                disk_submit (ksp[i]->ks_name, "disk_ops", kio.KIO_ROPS, kio.KIO_WOPS);
-		    }
-	    }
-    }
+            /* Get microseconds of run time since last poll */
+            rtime_us = (kio.rtime - last_rtime[i]) / 1000;
+            
+            /* Get microseconds of wait time since last poll */
+            wtime_us = (kio.wtime - last_wtime[i]) / 1000;
+
+            /* Number of iops this poll cycle */
+            new_iops = rw_iops - last_rw_iops[i];
+
+            /* get microseconds per op */
+            rtime_per_op = rtime_us / new_iops;
+            wtime_per_op = wtime_us / new_iops;  
+
+
+            WARNING("%s: wtime_us[%u] rtime_us[%u] new_iops[%u] rtime_per_op[%u] wtime_per_op[%u]",ksp[i]->ks_name,wtime_us,rtime_us,new_iops,rtime_per_op,wtime_per_op);  
+
+
+
+
+
+			disk_submit (ksp[i]->ks_name, "disk_octets",
+					kio.KIO_ROCTETS, kio.KIO_WOCTETS);
+			disk_submit (ksp[i]->ks_name, "disk_ops",
+					kio.KIO_ROPS, kio.KIO_WOPS);
+			/* FIXME: Convert this to microseconds if necessary */
+			disk_submit (ksp[i]->ks_name, "disk_time",
+                    rtime_per_op, wtime_per_op);
+                
+            last_rw_iops[i] = rw_iops;
+            last_rtime[i] = kio.KIO_RTIME;
+            last_wtime[i] = kio.KIO_WTIME;
+		}
+		else if (strncmp (ksp[i]->ks_class, "partition", 9) == 0)
+		{
+			disk_submit (ksp[i]->ks_name, "disk_octets",
+					kio.KIO_ROCTETS, kio.KIO_WOCTETS);
+			disk_submit (ksp[i]->ks_name, "disk_ops",
+					kio.KIO_ROPS, kio.KIO_WOPS);
+		}
+	}
 /* #endif defined(HAVE_LIBKSTAT) */
 
 #elif defined(HAVE_LIBSTATGRAB)
