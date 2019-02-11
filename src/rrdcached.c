@@ -68,14 +68,15 @@ static int value_list_to_string(char *buffer, int buffer_len,
                                 const data_set_t *ds, const value_list_t *vl) {
   int offset;
   int status;
-  time_t t;
+  double t;
 
   assert(0 == strcmp(ds->type, vl->type));
 
   memset(buffer, '\0', buffer_len);
 
-  t = CDTIME_T_TO_TIME_T(vl->time);
-  status = snprintf(buffer, buffer_len, "%lu", (unsigned long)t);
+  t = CDTIME_T_TO_DOUBLE(vl->time);
+
+  status = snprintf(buffer, buffer_len, "%.6f", t);
   if ((status < 1) || (status >= buffer_len))
     return -1;
   offset = status;
